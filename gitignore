@@ -1,0 +1,31 @@
+# ROOT auto-generated TTree files (use MakeClass to regenerate)
+mini.h
+mini.C
+
+# ROOT output files
+*.root
+
+# ROOT plot outputs
+*.pdf
+*.png
+*.eps
+*.svg
+
+# Compiled ROOT macros
+*.so
+*.d
+*.pcm
+
+# ROOT session history
+.root_hist
+
+# macOS
+.DS_Store
+
+# Linux
+*~
+\#*\#
+
+# Editor files
+.vscode/
+*.swp
