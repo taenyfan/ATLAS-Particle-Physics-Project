@@ -1,4 +1,13 @@
-# Hunting the Double Higgs: Signal Discrimination at ATLAS
+# ATLAS Di-Higgs Discrimination Project (Particle Physics)
+
+**University of Manchester — MPhys Project, Sep 2019 – Jan 2020**  
+**Supervisor:** Prof. Terry Wyatt  
+
+---
+
+**Full project report:** See [`report.pdf`](./report.pdf) for the complete methodology, results, and ROC curve analysis.
+
+---
 
 ## Overview
 
