@@ -1,7 +1,5 @@
 # ATLAS Di-Higgs Discrimination Project (Particle Physics)
 
-**University of Manchester — MPhys Project, Sep 2019 – Jan 2020**  
-**Supervisor:** Prof. Terry Wyatt  
 
 ---
 
