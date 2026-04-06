@@ -1,4 +1,4 @@
-# Kinematic Reconstruction and Signal Discrimination for HH → bbτ_h τ_l at ATLAS
+# Hunting the Double Higgs: Signal Discrimination at ATLAS
 
 ## Overview
 
