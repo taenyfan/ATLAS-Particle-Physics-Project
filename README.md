@@ -6,7 +6,7 @@
 **Collaborator:** François De Tournemire  
 **Degree:** Master of Physics (MPhys), School of Physics and Astronomy  
 
-This project was completed as part of the **MPhys (Master of Physics) degree** at the University of Manchester, School of Physics and Astronomy. It is a continuation of a series of supervised research projects contributing to the ATLAS experiment's search for di-Higgs production at the Large Hadron Collider (LHC).
+This project was completed as part of the **MPhys (Master of Physics) degree** at the University of Manchester, School of Physics and Astronomy. 
 
 ---
 
