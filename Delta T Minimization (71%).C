@@ -1,641 +1,458 @@
+/*
+ * delta_t_minimization.C
+ *
+ * Computes the ΔT discriminant for tt̄ → bb̄lτ_h event reconstruction
+ * (the "tt1" topology — standard dileptonic tt̄ decay with 2 neutrinos).
+ *
+ * This implements the ψ_T component of the combined Ψ discriminator, first
+ * introduced by Cookman & Harris (2019). For each event, the momenta of two
+ * neutrinos are varied to minimise a penalty function ΔT that measures
+ * kinematic consistency with the dileptonic tt̄ hypothesis. Events that
+ * reconstruct well as tt̄ are assigned a high ψ_T and are therefore less
+ * likely to be di-Higgs signal.
+ *
+ * 71% of tt̄ MC events achieve ΔT < 400 — hence the original filename.
+ * The complementary file delta_t3_8combinations.C handles the more complex
+ * tt3 topology (6 neutrinos), achieving 94% reconstruction efficiency.
+ *
+ * For each selected event (≥1e, ≥1μ, ≥2 b-jets, pT > 25 GeV, OS leptons),
+ * minimization is run 100 times across 2 b-jet assignment combinations.
+ * The minimum ΔT over all restarts and combinations is recorded.
+ *
+ * Additional histograms are filled for the reconstructed W and top masses,
+ * useful for validating the quality of the reconstruction.
+ *
+ * Part of the ATLAS Di-Higgs Discrimination Project.
+ * University of Manchester, MPhys Project, Sep 2019 – Jan 2020.
+ * Supervisor: Prof. Terry Wyatt.
+ *
+ * Usage (in ROOT):
+ *   root [0] .L delta_t_minimization.C
+ *   root [1] mini t("your_data.root", "mini")
+ *   root [2] t.Loop()
+ */
+
 #define mini_cxx
 #include "mini.h"
+
 #include <TH2.h>
 #include <TStyle.h>
 #include <TCanvas.h>
-#include <math.h>
-#include <cstdlib>
-#include <tuple>
+#include <TError.h>
+
 #include "Math/Minimizer.h"
 #include "Math/Factory.h"
 #include "Math/Functor.h"
-#include "TRandom2.h"
-#include "TError.h"
-#include <iostream>
+
+#include <array>
 #include <cmath>
-#include <stdlib.h>     /* abs */
+#include <iostream>
 #include <limits>
 #include <random>
-#include <array>
+#include <tuple>
 #include <vector>
 
 using namespace std;
 
+// ============================================================
+// Physical constants (all masses in MeV)
+// ============================================================
 
-// Function to generate a random double number between two limits
-double getRandomDouble(double lower_bound,  double upper_bound)
+static const double MW         = 80379.0;   // W boson mass [MeV]
+static const double MT         = 173000.0;  // Top quark mass [MeV]
+static const double M_ELECTRON = 0.511;     // Electron mass [MeV]
+static const double M_MUON     = 105.66;    // Muon mass [MeV]
+static const double PT_CUT     = 25000.0;   // Minimum pT cut [MeV]
+
+// ============================================================
+// Minimization settings
+// ============================================================
+
+static const int    N_REPEATS      = 100;   // Random restarts per event
+static const int    N_COMBINATIONS = 2;     // b-jet assignment combinations
+static const double STEP_MOMENTUM  = 10.0;  // Step size for neutrino momenta
+
+// ============================================================
+// Utility: random double in [lower, upper]
+// ============================================================
+
+double getRandomDouble(double lower, double upper)
 {
-   static std::default_random_engine generator;
-   std::uniform_real_distribution<double> distribution(lower_bound,upper_bound);
-
-   return distribution(generator) ;
+    static std::default_random_engine generator;
+    std::uniform_real_distribution<double> distribution(lower, upper);
+    return distribution(generator);
 }
 
-// Function to create an energy-momentum four vector for a particle
-array<double, 4> createMomentumFourVector(double energy, double px, double py, double pz)
+// ============================================================
+// Four-vector utilities
+// ============================================================
+
+using FourVec = array<double, 4>;  // {E, px, py, pz}
+
+FourVec makeFourVec(double E, double px, double py, double pz)
 {
-	array<double, 4> fourVector = {energy, px, py, pz}; 
-	return fourVector; 
+    return {E, px, py, pz};
 }
 
-// Functions to add two/three/four/five four vectors (Overloaded)
-array<double, 4> addFourVectors(array<double, 4> A, array<double, 4> B)
+FourVec addFourVecs(std::initializer_list<FourVec> vecs)
 {
-	array<double, 4> result = { A[0] + B[0], A[1] + B[1], A[2] + B[2], A[3] + B[3] };
-	return result;
-}
-array<double, 4> addFourVectors(array<double, 4> A, array<double, 4> B, array<double, 4> C)
-{
-	array<double, 4> result = { A[0] + B[0] + C[0], A[1] + B[1]+C[1], A[2] + B[2]+C[2], A[3] + B[3]+C[3] };
-	return result;
-}
-array<double, 4> addFourVectors(array<double, 4> A, array<double, 4> B, array<double, 4> C, array<double, 4> D)
-{
-	array<double, 4> result = { A[0] + B[0] + C[0]+D[0], A[1] + B[1]+C[1]+D[1], A[2] + B[2]+C[2]+D[2], A[3] + B[3]+C[3]+D[3] };
-	return result;
-}
-array<double, 4> addFourVectors(array<double, 4> A, array<double, 4> B, array<double, 4> C, array<double, 4> D, array<double, 4> E)
-{
-	array<double, 4> result = { A[0]+B[0]+C[0]+D[0]+E[0], A[1]+B[1]+C[1]+D[1]+E[1], A[2]+B[2]+C[2]+D[2]+E[2], A[3]+B[3]+C[3]+D[3]+E[3] };
-	return result;
+    FourVec result = {0, 0, 0, 0};
+    for (const auto& v : vecs)
+        for (int i = 0; i < 4; ++i)
+            result[i] += v[i];
+    return result;
 }
 
-
-// Function to take dot product of two four vectors
-double dotProduct(array<double, 4> A, array<double, 4> B)
+double invariantMass(const FourVec& A)
 {
-	double result = (A[0] * B[0]) - (A[1] * B[1]) - (A[2] * B[2]) - (A[3] * B[3]);
-	return result; 
+    double m2 = A[0]*A[0] - A[1]*A[1] - A[2]*A[2] - A[3]*A[3];
+    return (m2 >= 0) ? sqrt(m2) : 0.0;
 }
 
-// Function to calculate invariant mass of an energy-momentum four vector
-double getInvariantMass(array<double, 4> A)
+FourVec masslessFourVec(double px, double py, double pz)
 {
-	return sqrt ( (A[0]*A[0]) - (A[1]*A[1]) - (A[2]*A[2]) - (A[3]*A[3]) );
+    return {sqrt(px*px + py*py + pz*pz), px, py, pz};
 }
 
-// Function to calculate invariant W mass (using Eqn 3.4)
-// IF given mass of lepton lep_mass, three-momentum of lepton lep_px, lep_py, lep_pz, and three-momentum of neutrino
-//    neut_px, neut_py, neut_pz
-double getWMass(double lep_mass, double lep_px, double lep_py, double lep_pz, double neut_px, double neut_py,
-	double neut_pz)
+FourVec massiveFourVec(double px, double py, double pz, double mass)
 {
-	double A = lep_px*lep_px + lep_py*lep_py + lep_pz*lep_pz + lep_mass*lep_mass ;
-	double B = neut_px*neut_px + neut_py*neut_py + neut_pz*neut_pz ; 
-	double w_mass = sqrt( pow( (sqrt(A) + sqrt(B)) ,2) - pow( (lep_px + neut_px) ,2) - pow( (lep_py + neut_py) ,2) 
-		- pow( (lep_pz + neut_pz) ,2) );
-
-	return w_mass;
+    return {sqrt(px*px + py*py + pz*pz + mass*mass), px, py, pz};
 }
 
-// Function to calculate invariant T mass
-// Using Eqn (5) Daniel Cookman Report
-double getTMass(double bjet_E, double bjet_px, double bjet_py, double bjet_pz, double lep_mass, double lep_px,
-  double lep_py, double lep_pz, double neut_px, double neut_py, double neut_pz)
+void polarToCartesian(double pt, double phi, double eta,
+                      double& px, double& py, double& pz)
 {
-  double lep_E = sqrt(lep_px*lep_px + lep_py*lep_py + lep_pz*lep_pz + lep_mass*lep_mass);
-  double neut_E = sqrt(neut_px*neut_px + neut_py*neut_py + neut_pz*neut_pz);
-  double TMassSquared = pow( bjet_E + neut_E + lep_E ,2) - pow( bjet_px + lep_px + neut_px ,2) 
-                        - pow( bjet_py + lep_py + neut_py ,2) - pow( bjet_pz + lep_pz + neut_pz ,2);
-
-  return sqrt(TMassSquared);
+    px = pt * cos(phi);
+    py = pt * sin(phi);
+    pz = pt * sinh(eta);
 }
 
-double Tfunction(const double *xx )
+// ============================================================
+// ΔT penalty function (tt1 topology — 2 neutrinos)
+//
+// Free variables (xx[0..5]):
+//   xx[0..2] : three-momentum of ν_l1 (neutrino from top decay)
+//   xx[3..5] : three-momentum of ν_l2 (neutrino from antitop decay)
+//
+// Fixed inputs (xx[6..23]):
+//   Kinematic info of leptons l1, l2, MET, and two b-jets.
+// ============================================================
+
+double Tfunction(const double* xx)
 {
-  // Declare Variables (Momenta of the Four Neutrinos)
-  const Double_t neut_px_l1 = xx[0]; // Three-Momentum of electron/muon neutrino from top decay (v_l1) 
-  const Double_t neut_py_l1 = xx[1]; // 
-  const Double_t neut_pz_l1 = xx[2]; // (Variables)
+    // --- Free variables ---
+    const double neut_px_l1 = xx[0];
+    const double neut_py_l1 = xx[1];
+    const double neut_pz_l1 = xx[2];
+    const double neut_px_l2 = xx[3];
+    const double neut_py_l2 = xx[4];
+    const double neut_pz_l2 = xx[5];
 
-  const Double_t neut_px_l2 = xx[3]; // Three-Momentum of electron/muon neutrino from antitop decay (v_l2)
-  const Double_t neut_py_l2 = xx[4]; // 
-  const Double_t neut_pz_l2 = xx[5]; // (Variables)
-  // End of Declare Variables
+    // --- Fixed inputs: lepton 1 (from top decay) ---
+    const double lep_pt_l1   = xx[6];
+    const double lep_phi_l1  = xx[7];
+    const double lep_eta_l1  = xx[8];
+    const double lep_mass_l1 = xx[9];
 
-  // Declare Constants (Momenta of Electron, Muon, B Jets, Missing Energy)
-  const Double_t lep_pt_l1 = xx[6];   // Kinematic Info of Electron/Muon from top decay 
-  const Double_t lep_phi_l1 = xx[7];  // 
-  const Double_t lep_eta_l1 = xx[8];  // 
-  const Double_t lep_mass_l1 = xx[9]; // (Constants)
+    // --- Fixed inputs: lepton 2 (from antitop decay) ---
+    const double lep_pt_l2   = xx[10];
+    const double lep_phi_l2  = xx[11];
+    const double lep_eta_l2  = xx[12];
+    const double lep_mass_l2 = xx[13];
 
-  const Double_t lep_pt_l2 = xx[10];  // Kinematic Info of Electron/Muon from antitop decay 
-  const Double_t lep_phi_l2 = xx[11]; // 
-  const Double_t lep_eta_l2 = xx[12]; // 
-  const Double_t lep_mass_l2 = xx[13]; // (Constants)
+    // --- Fixed inputs: MET ---
+    const double et_miss  = xx[14];
+    const double phi_miss = xx[15];
 
-  const Double_t et_miss = xx[14];  // Missing Transverse Energy (Constants)
-  const Double_t phi_miss = xx[15]; // Missing Transverse Phi (Constants)
+    // --- Fixed inputs: b-jets ---
+    const double bjet_E_1   = xx[16];
+    const double bjet_pt_1  = xx[17];
+    const double bjet_phi_1 = xx[18];
+    const double bjet_eta_1 = xx[19];
+    const double bjet_E_2   = xx[20];
+    const double bjet_pt_2  = xx[21];
+    const double bjet_phi_2 = xx[22];
+    const double bjet_eta_2 = xx[23];
 
-  const Double_t bjet_E_1 = xx[16]; // Kinematic Info of Bjet from top decay (Constants)
-  const Double_t bjet_pt_1 = xx[17];
-  const Double_t bjet_phi_1 = xx[18];
-  const Double_t bjet_eta_1 = xx[19];
+    // --- Coordinate conversion ---
+    double lep_px_l1, lep_py_l1, lep_pz_l1;
+    double lep_px_l2, lep_py_l2, lep_pz_l2;
+    double bjet_px_1, bjet_py_1, bjet_pz_1;
+    double bjet_px_2, bjet_py_2, bjet_pz_2;
 
-  const Double_t bjet_E_2 = xx[20]; // Kinematic Info of Bjet from antitop decay (Constants)
-  const Double_t bjet_pt_2 = xx[21];
-  const Double_t bjet_phi_2 = xx[22];
-  const Double_t bjet_eta_2 = xx[23];
-  // End of Declare Constants 
+    polarToCartesian(lep_pt_l1, lep_phi_l1, lep_eta_l1, lep_px_l1, lep_py_l1, lep_pz_l1);
+    polarToCartesian(lep_pt_l2, lep_phi_l2, lep_eta_l2, lep_px_l2, lep_py_l2, lep_pz_l2);
+    polarToCartesian(bjet_pt_1, bjet_phi_1, bjet_eta_1, bjet_px_1, bjet_py_1, bjet_pz_1);
+    polarToCartesian(bjet_pt_2, bjet_phi_2, bjet_eta_2, bjet_px_2, bjet_py_2, bjet_pz_2);
 
-  // Coordinate Conversion: Polar to Cartesian
-  const Double_t lep_px_l1 = lep_pt_l1 * cos(lep_phi_l1) ; //  
-  const Double_t lep_py_l1 = lep_pt_l1 * sin(lep_phi_l1) ; //
-  const Double_t lep_pz_l1 = lep_pt_l1 * sinh(lep_eta_l1) ; //
+    const double et_miss_x = et_miss * cos(phi_miss);
+    const double et_miss_y = et_miss * sin(phi_miss);
 
-  const Double_t lep_px_l2 = lep_pt_l2 * cos(lep_phi_l2) ; //  
-  const Double_t lep_py_l2 = lep_pt_l2 * sin(lep_phi_l2) ; // 
-  const Double_t lep_pz_l2 = lep_pt_l2 * sinh(lep_eta_l2) ; // 
+    // --- Build four-vectors ---
+    const FourVec p_neut_l1 = masslessFourVec(neut_px_l1, neut_py_l1, neut_pz_l1);
+    const FourVec p_neut_l2 = masslessFourVec(neut_px_l2, neut_py_l2, neut_pz_l2);
+    const FourVec p_l1      = massiveFourVec(lep_px_l1, lep_py_l1, lep_pz_l1, lep_mass_l1);
+    const FourVec p_l2      = massiveFourVec(lep_px_l2, lep_py_l2, lep_pz_l2, lep_mass_l2);
+    const FourVec p_bjet_1  = makeFourVec(bjet_E_1, bjet_px_1, bjet_py_1, bjet_pz_1);
+    const FourVec p_bjet_2  = makeFourVec(bjet_E_2, bjet_px_2, bjet_py_2, bjet_pz_2);
 
-  const Double_t et_miss_x = et_miss * cos(phi_miss); //  
-  const Double_t et_miss_y = et_miss * sin(phi_miss); //
+    // --- Intermediate particles ---
+    const FourVec p_w1 = addFourVecs({p_l1, p_neut_l1});           // W+
+    const FourVec p_w2 = addFourVecs({p_l2, p_neut_l2});           // W-
+    const FourVec p_t1 = addFourVecs({p_l1, p_neut_l1, p_bjet_1}); // top
+    const FourVec p_t2 = addFourVecs({p_l2, p_neut_l2, p_bjet_2}); // antitop
 
-  const Double_t bjet_px_1 = bjet_pt_1 * cos(bjet_phi_1) ; // 
-  const Double_t bjet_py_1 = bjet_pt_1 * sin(bjet_phi_1) ;
-  const Double_t bjet_pz_1 = bjet_pt_1 * sinh(bjet_eta_1) ; 
+    const double m_w1 = invariantMass(p_w1);
+    const double m_w2 = invariantMass(p_w2);
+    const double m_t1 = invariantMass(p_t1);
+    const double m_t2 = invariantMass(p_t2);
 
-  const Double_t bjet_px_2 = bjet_pt_2 * cos(bjet_phi_2) ; // 
-  const Double_t bjet_py_2 = bjet_pt_2 * sin(bjet_phi_2) ;
-  const Double_t bjet_pz_2 = bjet_pt_2 * sinh(bjet_eta_2) ; 
-  // End of Coordinate Conversion
-
-  // Create four vectors for final products in decay (bbllvv)
-  const array<double, 4> p_neut_l1 = createMomentumFourVector( sqrt(neut_px_l1*neut_px_l1 + neut_py_l1*neut_py_l1 + 
-  	neut_pz_l1*neut_pz_l1) , neut_px_l1, neut_py_l1, neut_pz_l1 );  // electron/muon neutrino from top decay (v_l1) 
-  const array<double, 4> p_neut_l2 = createMomentumFourVector( sqrt(neut_px_l2*neut_px_l2 + neut_py_l2*neut_py_l2 + 
-  	neut_pz_l2*neut_pz_l2) , neut_px_l2, neut_py_l2, neut_pz_l2 ); // electron/muon neutrino from antitop decay (v_l2)
-
-  const array<double, 4> p_l1 = createMomentumFourVector( sqrt(lep_px_l1*lep_px_l1 + lep_py_l1*lep_py_l1 + 
-  	lep_pz_l1*lep_pz_l1 + lep_mass_l1*lep_mass_l1) , lep_px_l1, lep_py_l1, lep_pz_l1 ); // Electron/Muon from top decay
-  const array<double, 4> p_l2 = createMomentumFourVector( sqrt(lep_px_l2*lep_px_l2 + lep_py_l2*lep_py_l2 + 
-  	lep_pz_l2*lep_pz_l2 + lep_mass_l2*lep_mass_l2) , lep_px_l2, lep_py_l2, lep_pz_l2); // Electron/Muon from antitop decay 
-  
-  const array<double, 4> p_bjet_1 = createMomentumFourVector( bjet_E_1, bjet_px_1, bjet_py_1, bjet_pz_1); // Bjet from top decay
-  const array<double, 4> p_bjet_2 = createMomentumFourVector( bjet_E_2, bjet_px_2, bjet_py_2, bjet_pz_2); // Bjet from antitop decay
-  // End of Creation of four vectors for final products
-
-  // Calculate four vectors for intermediate products in decay (t1, t2, w1, w2)
-  // t1 ->top t2->antitop w1->W+ w2->W-
-  const array<double, 4> p_w2 = addFourVectors(p_l2, p_neut_l2);               // W- 
-  const array<double, 4> p_w1 = addFourVectors(p_l1, p_neut_l1);             // W+
-  const array<double, 4> p_t1 = addFourVectors(p_l1, p_neut_l1, p_bjet_1);    //  top 
-  const array<double, 4> p_t2 = addFourVectors(p_bjet_2, p_neut_l2, p_l2); // antitop
-  // End of Caculate four vectors for intermediate products
-
-  // Calculate invariant masses of intermediate products (t1, t2, w1, w2)
-  const Double_t m_w2 = getInvariantMass(p_w2);
-  const Double_t m_w1 = getInvariantMass(p_w1);
-  const Double_t m_t1 = getInvariantMass(p_t1);
-  const Double_t m_t2 = getInvariantMass(p_t2);
-  // End of Cacluate invariant masses of intermediate products
-
-  // Return discriminant delta_T squared 
-  return pow(m_w2-80379, 2) + pow(m_w1-80379, 2) + pow(m_t1-173000, 2) + 
-  		 pow(m_t2-173000, 2) + pow(neut_px_l1 + neut_px_l2 - et_miss_x, 2) + 
-  		 pow(neut_py_l1 + neut_py_l2  - et_miss_y, 2); 
-
+    // --- ΔT² discriminant ---
+    return pow(m_w1 - MW, 2) + pow(m_w2 - MW, 2) +
+           pow(m_t1 - MT, 2) + pow(m_t2 - MT, 2) +
+           pow(neut_px_l1 + neut_px_l2 - et_miss_x, 2) +
+           pow(neut_py_l1 + neut_py_l2 - et_miss_y, 2);
 }
 
-std::tuple<double,double,double,double,double,double>  MinimizeTfunction(
-	double lep_pt_l1, double lep_phi_l1, double lep_eta_l1, double lep_mass_l1, 
-	double lep_pt_l2, double lep_phi_l2, double lep_eta_l2, double lep_mass_l2, 
-	double et_miss,  double phi_miss, 
-	double bjet_E_1, double bjet_pt_1, double bjet_phi_1, double bjet_eta_1, 
-	double bjet_E_2, double bjet_pt_2, double bjet_phi_2, double bjet_eta_2, 
-	const char * minName = "Minuit2", const char *algoName = "")
+// ============================================================
+// Result struct — bundles all outputs from one minimization
+// ============================================================
+
+struct MinResult {
+    double delta_T = std::numeric_limits<double>::max();
+    double m_w1    = 0;
+    double m_w2    = 0;
+    double m_t1    = 0;
+    double m_t2    = 0;
+};
+
+// ============================================================
+// Minimise Tfunction for a single b-jet combination
+// Returns the best MinResult found across N_REPEATS restarts
+// ============================================================
+
+MinResult MinimizeTfunction(
+    double lep_pt_l1, double lep_phi_l1, double lep_eta_l1, double lep_mass_l1,
+    double lep_pt_l2, double lep_phi_l2, double lep_eta_l2, double lep_mass_l2,
+    double et_miss, double phi_miss,
+    double bjet_E_1, double bjet_pt_1, double bjet_phi_1, double bjet_eta_1,
+    double bjet_E_2, double bjet_pt_2, double bjet_phi_2, double bjet_eta_2,
+    const char* minName = "Minuit2", const char* algoName = "")
 {
-   // create minimizer giving a name and a name (optionally) for the specific
-   // algorithm
-   // possible choices are:
-   //     minName                  algoName
-   // Minuit /Minuit2             Migrad, Simplex,Combined,Scan  (default is Migrad)
-   //  Minuit2                     Fumili2
-   //  Fumili
-   //  GSLMultiMin                ConjugateFR, ConjugatePR, BFGS,
-   //                              BFGS2, SteepestDescent
-   //  GSLMultiFit
-   //   GSLSimAn
-   //   Genetic
-   ROOT::Math::Minimizer* minimum =
-      ROOT::Math::Factory::CreateMinimizer(minName, algoName);
+    double lep_px_l1, lep_py_l1, lep_pz_l1;
+    double lep_px_l2, lep_py_l2, lep_pz_l2;
+    polarToCartesian(lep_pt_l1, lep_phi_l1, lep_eta_l1, lep_px_l1, lep_py_l1, lep_pz_l1);
+    polarToCartesian(lep_pt_l2, lep_phi_l2, lep_eta_l2, lep_px_l2, lep_py_l2, lep_pz_l2);
 
-   // set tolerance , etc...
-   minimum->SetMaxFunctionCalls(100000); // for Minuit/Minuit2
-   minimum->SetMaxIterations(10000);  // for GSL
-   minimum->SetTolerance(0.1);
-   minimum->SetPrintLevel(-1);
+    ROOT::Math::Minimizer* minimizer =
+        ROOT::Math::Factory::CreateMinimizer(minName, algoName);
 
-   // Transformation of Coordinates for Input Values (Polar to Cartesian)
-  double lep_px_l1 = lep_pt_l1 * cos(lep_phi_l1) ; 
-  double lep_py_l1 = lep_pt_l1 * sin(lep_phi_l1) ; 
-  double lep_pz_l1 = lep_pt_l1 * sinh(lep_eta_l1) ; 
+    minimizer->SetMaxFunctionCalls(100000);
+    minimizer->SetMaxIterations(10000);
+    minimizer->SetTolerance(0.1);
+    minimizer->SetPrintLevel(0);
 
-  double lep_px_l2 = lep_pt_l2 * cos(lep_phi_l2) ; 
-  double lep_py_l2 = lep_pt_l2 * sin(lep_phi_l2) ;  
-  double lep_pz_l2 = lep_pt_l2 * sinh(lep_eta_l2) ; 
+    ROOT::Math::Functor f(&Tfunction, 24);
+    minimizer->SetFunction(f);
 
-  double et_miss_x = et_miss * cos(phi_miss); 
-  double et_miss_y = et_miss * sin(phi_miss); 
+    const double step = STEP_MOMENTUM;
+    MinResult best;
 
-  double bjet_px_1 = bjet_pt_1 * cos(bjet_phi_1) ; 
-  double bjet_py_1 = bjet_pt_1 * sin(bjet_phi_1) ;
-  double bjet_pz_1 = bjet_pt_1 * sinh(bjet_eta_1) ; 
+    for (int rep = 0; rep < N_REPEATS; ++rep)
+    {
+        // Randomise starting neutrino momenta around lepton momenta
+        minimizer->SetVariable(0, "neut_px_l1", getRandomDouble(-2*lep_px_l1, 2*lep_px_l1), step);
+        minimizer->SetVariable(1, "neut_py_l1", getRandomDouble(-2*lep_py_l1, 2*lep_py_l1), step);
+        minimizer->SetVariable(2, "neut_pz_l1", getRandomDouble(-2*lep_pz_l1, 2*lep_pz_l1), step);
+        minimizer->SetVariable(3, "neut_px_l2", getRandomDouble(-2*lep_px_l2, 2*lep_px_l2), step);
+        minimizer->SetVariable(4, "neut_py_l2", getRandomDouble(-2*lep_py_l2, 2*lep_py_l2), step);
+        minimizer->SetVariable(5, "neut_pz_l2", getRandomDouble(-2*lep_pz_l2, 2*lep_pz_l2), step);
 
-  double bjet_px_2 = bjet_pt_2 * cos(bjet_phi_2) ; 
-  double bjet_py_2 = bjet_pt_2 * sin(bjet_phi_2) ;
-  double bjet_pz_2 = bjet_pt_2 * sinh(bjet_eta_2) ; 
-  // End of Transformation of Coordinates 
+        // Fixed inputs
+        minimizer->SetFixedVariable(6,  "lep_pt_l1",   lep_pt_l1);
+        minimizer->SetFixedVariable(7,  "lep_phi_l1",  lep_phi_l1);
+        minimizer->SetFixedVariable(8,  "lep_eta_l1",  lep_eta_l1);
+        minimizer->SetFixedVariable(9,  "lep_mass_l1", lep_mass_l1);
+        minimizer->SetFixedVariable(10, "lep_pt_l2",   lep_pt_l2);
+        minimizer->SetFixedVariable(11, "lep_phi_l2",  lep_phi_l2);
+        minimizer->SetFixedVariable(12, "lep_eta_l2",  lep_eta_l2);
+        minimizer->SetFixedVariable(13, "lep_mass_l2", lep_mass_l2);
+        minimizer->SetFixedVariable(14, "et_miss",     et_miss);
+        minimizer->SetFixedVariable(15, "phi_miss",    phi_miss);
+        minimizer->SetFixedVariable(16, "bjet_E_1",    bjet_E_1);
+        minimizer->SetFixedVariable(17, "bjet_pt_1",   bjet_pt_1);
+        minimizer->SetFixedVariable(18, "bjet_phi_1",  bjet_phi_1);
+        minimizer->SetFixedVariable(19, "bjet_eta_1",  bjet_eta_1);
+        minimizer->SetFixedVariable(20, "bjet_E_2",    bjet_E_2);
+        minimizer->SetFixedVariable(21, "bjet_pt_2",   bjet_pt_2);
+        minimizer->SetFixedVariable(22, "bjet_phi_2",  bjet_phi_2);
+        minimizer->SetFixedVariable(23, "bjet_eta_2",  bjet_eta_2);
 
+        minimizer->Minimize();
 
-   // create function wrapper for minimizer
-   // a IMultiGenFunction type
-   ROOT::Math::Functor f(&Tfunction, 24);
+        double val = sqrt(minimizer->MinValue()); // ΔT = sqrt(ΔT²)
+        if (val < best.delta_T)
+        {
+            const double* xs = minimizer->X();
+            best.delta_T = val;
 
-   // Minimization Step Size 
-   double step[6] = {};
-   for(int i=0; i<6; i++)
-   {
-   	step[i] = 10; 
-   }
+            // Reconstruct intermediate masses at the best-fit neutrino momenta
+            double lep_px_l1c, lep_py_l1c, lep_pz_l1c;
+            double lep_px_l2c, lep_py_l2c, lep_pz_l2c;
+            double bjet_px_1c, bjet_py_1c, bjet_pz_1c;
+            double bjet_px_2c, bjet_py_2c, bjet_pz_2c;
+            polarToCartesian(lep_pt_l1, lep_phi_l1, lep_eta_l1, lep_px_l1c, lep_py_l1c, lep_pz_l1c);
+            polarToCartesian(lep_pt_l2, lep_phi_l2, lep_eta_l2, lep_px_l2c, lep_py_l2c, lep_pz_l2c);
+            polarToCartesian(bjet_pt_1, bjet_phi_1, bjet_eta_1, bjet_px_1c, bjet_py_1c, bjet_pz_1c);
+            polarToCartesian(bjet_pt_2, bjet_phi_2, bjet_eta_2, bjet_px_2c, bjet_py_2c, bjet_pz_2c);
 
-   // Minimization Starting Point
-   double variable[6] = {}; 
-   // Randomize the starting momenta of the four neutrinos 
-   // ***NOTE: MIGHT NOT BE THE BESY WAY***
-    variable[0] = getRandomDouble(-2*lep_px_l1, 2*lep_px_l1);
-    variable[1] =getRandomDouble(-2*lep_py_l1,2*lep_py_l1); 
-    variable[2] = getRandomDouble(-2*lep_pz_l1,2*lep_pz_l1);
-    variable[3] = getRandomDouble(-2*lep_px_l2,2*lep_px_l2);
-    variable[4] = getRandomDouble(-2*lep_py_l2,2*lep_py_l2);
-    variable[5] = getRandomDouble(-2*lep_pz_l2,2*lep_pz_l2);
- 
-  //
-   minimum->SetFunction(f);
+            FourVec p_nl1 = masslessFourVec(xs[0], xs[1], xs[2]);
+            FourVec p_nl2 = masslessFourVec(xs[3], xs[4], xs[5]);
+            FourVec p_l1  = massiveFourVec(lep_px_l1c, lep_py_l1c, lep_pz_l1c, lep_mass_l1);
+            FourVec p_l2  = massiveFourVec(lep_px_l2c, lep_py_l2c, lep_pz_l2c, lep_mass_l2);
+            FourVec p_b1  = makeFourVec(bjet_E_1, bjet_px_1c, bjet_py_1c, bjet_pz_1c);
+            FourVec p_b2  = makeFourVec(bjet_E_2, bjet_px_2c, bjet_py_2c, bjet_pz_2c);
 
-   // Set the free variables to be minimized !
-   minimum->SetVariable(0, "neut_px_l1", variable[0], step[0]);
-   minimum->SetVariable(1, "neut_py_l1", variable[1], step[1] );
-   minimum->SetVariable(2, "neut_pz_l1", variable[2], step[2] );
+            best.m_w1 = invariantMass(addFourVecs({p_l1, p_nl1}));
+            best.m_w2 = invariantMass(addFourVecs({p_l2, p_nl2}));
+            best.m_t1 = invariantMass(addFourVecs({p_l1, p_nl1, p_b1}));
+            best.m_t2 = invariantMass(addFourVecs({p_l2, p_nl2, p_b2}));
+        }
+    }
 
-   minimum->SetVariable(3, "neut_px_l2", variable[3], step[3]);
-   minimum->SetVariable(4, "neut_py_l2", variable[4], step[4]);
-   minimum->SetVariable(5, "neut_pz_l2", variable[5], step[5] );
-
-
-   // Set the fixed variables !
-
-   minimum->SetFixedVariable(6, "lep_pt_l1", lep_pt_l1);
-   minimum->SetFixedVariable(7, "lep_phi_l1",lep_phi_l1);
-   minimum->SetFixedVariable(8, "lep_eta_l1",lep_eta_l1);
-   minimum->SetFixedVariable(9, "lep_mass_l1",lep_mass_l1);
-
-   minimum->SetFixedVariable(10, "lep_pt_l2",lep_pt_l2);
-   minimum->SetFixedVariable(11, "lep_phi_l2",lep_phi_l2);
-   minimum->SetFixedVariable(12, "lep_eta_l2",lep_eta_l2);
-   minimum->SetFixedVariable(13, "lep_mass_l2",lep_mass_l2);
-
-   minimum->SetFixedVariable(14, "et_miss",et_miss);
-   minimum->SetFixedVariable(15, "phi_miss",phi_miss);
-
-   minimum->SetFixedVariable(16, "bjet_E_1",bjet_E_1);
-   minimum->SetFixedVariable(17, "bjet_pt_1",bjet_pt_1);
-   minimum->SetFixedVariable(18, "bjet_phi_1",bjet_phi_1);
-   minimum->SetFixedVariable(19, "bjet_eta_1",bjet_eta_1);
-
-   minimum->SetFixedVariable(20, "bjet_E_2",bjet_E_2);
-   minimum->SetFixedVariable(21, "bjet_pt_2",bjet_pt_2);
-   minimum->SetFixedVariable(22, "bjet_phi_2",bjet_phi_2);
-   minimum->SetFixedVariable(23, "bjet_eta_2",bjet_eta_2);
-
-
-
-   // Do the minimization !
-   minimum->Minimize();
-   const double *xs = minimum->X();
-
-  // Determine four vectors for final products in decay after minimization (bbllvv)
-   array<double, 4> p_neut_l1 = createMomentumFourVector( sqrt(xs[0]*xs[0] + xs[1]*xs[1] + 
-  	xs[2]*xs[2]) , xs[0], xs[1], xs[2] );  // electron/muon neutrino from top decay (v_l1) 
-   array<double, 4> p_neut_l2 = createMomentumFourVector( sqrt(xs[3]*xs[3] + xs[4]*xs[4] + 
-  	xs[5]*xs[5]) , xs[3], xs[4], xs[5] ); // electron/muon neutrino from antitop decay (v_l2)
-
-   array<double, 4> p_l1 = createMomentumFourVector( sqrt(lep_px_l1*lep_px_l1 + lep_py_l1*lep_py_l1 + 
-  	lep_pz_l1*lep_pz_l1 + lep_mass_l1*lep_mass_l1) , lep_px_l1, lep_py_l1, lep_pz_l1 ); // Electron/Muon from top decay
-   array<double, 4> p_l2 = createMomentumFourVector( sqrt(lep_px_l2*lep_px_l2 + lep_py_l2*lep_py_l2 + 
-  	lep_pz_l2*lep_pz_l2 + lep_mass_l2*lep_mass_l2) , lep_px_l2, lep_py_l2, lep_pz_l2); // Electron/Muon from antitop decay 
-  
-   array<double, 4> p_bjet_1 = createMomentumFourVector( bjet_E_1, bjet_px_1, bjet_py_1, bjet_pz_1); // Bjet from top decay
-   array<double, 4> p_bjet_2 = createMomentumFourVector( bjet_E_2, bjet_px_2, bjet_py_2, bjet_pz_2); // Bjet from antitop decay
-  // End of Creation of four vectors for final products
-
-  // Calculate four vectors for intermediate products in decay after minimization 
-  array<double, 4> p_w2 = addFourVectors(p_l2, p_neut_l2);               // w-
-  array<double, 4> p_w1 = addFourVectors(p_l1, p_neut_l1);             // W+
-  array<double, 4> p_t1 = addFourVectors(p_l1, p_neut_l1, p_bjet_1);    //  top quark 
-  array<double, 4> p_t2 = addFourVectors(p_bjet_2, p_neut_l2, p_l2); // antitop 
-  // End of Caculate four vectors for intermediate products
-
-  // Calculate invariant masses of intermediate products after minimization (tau, w1_1, w1_2, w2, t_1, t_2)
-  double m_w2 = getInvariantMass(p_w2);
-  double m_w1 = getInvariantMass(p_w1);
-  double m_t1 = getInvariantMass(p_t1);
-  double m_t2 = getInvariantMass(p_t2);
-  // End of Cacluate invariant masses of intermediate products
-
-  // Caculate discriminant delta T
-  double delta_T = sqrt( pow(m_w2-80379, 2) + pow(m_w1-80379, 2) + pow(m_t1-173000, 2) + 
-  		 pow(m_t2-173000, 2) + pow(xs[0] + xs[3] - et_miss_x, 2) + 
-  		 pow(xs[1] + xs[4]  - et_miss_y, 2)  );
-
-   /*
-   // expected minimum is 0
-   if ( minimum->MinValue()  < 1.E-4  && f(xs) < 1.E-4)
-      std::cout << "Minimizer " << minName << " - " << algoName
-                << "   converged to the right minimum" << std::endl;
-   else {
-      std::cout << "Minimizer " << minName << " - " << algoName
-                << "   failed to converge !!!" << std::endl;
-      Error("NumericalMinimization","fail to converge");
-   }
-   */ 
-
-   return std::make_tuple(delta_T, m_w1, m_w2, m_t1, m_t2, xs[0]);
+    delete minimizer;
+    return best;
 }
 
+// ============================================================
+// Main event loop
+// ============================================================
 
 void mini::Loop()
 {
+    if (fChain == 0) return;
 
-//   In a ROOT session, you can do:
-//      root> .L mini.C
-//      root> mini t
-//      root> t.GetEntry(12); // Fill t data members with entry number 12
-//      root> t.Show();       // Show values of entry 12
-//      root> t.Show(16);     // Read and show values of entry 16
-//      root> t.Loop();       // Loop on all entries
-//
+    Long64_t nentries = fChain->GetEntriesFast();
 
-//     This is the loop skeleton where:
-//    jentry is the global entry number in the chain
-//    ientry is the entry number in the current Tree
-//  Note that the argument to GetEntry must be:
-//    jentry for TChain::GetEntry
-//    ientry for TTree::GetEntry and TBranch::GetEntry
-//
-//       To read only selected branches, Insert statements like:
-// METHOD1:
-//    fChain->SetBranchStatus("*",0);  // disable all branches
-//    fChain->SetBranchStatus("branchname",1);  // activate branchname
-// METHOD2: replace line
-//    fChain->GetEntry(jentry);       //read all branches
-//by  b_branchname->GetEntry(ientry); //read only this branch
+    // Histograms
+    TH1F* h_delta_T  = new TH1F("h_delta_T",  "#DeltaT discriminant | #geq1e, #geq1#mu, #geq2 b-jets", 1000, 0, 400);
+    TH1F* h_w1_mass  = new TH1F("h_w1_mass",  "Reconstructed W^{+} mass",   1000, 20000,  140000);
+    TH1F* h_w2_mass  = new TH1F("h_w2_mass",  "Reconstructed W^{-} mass",   1000, 20000,  140000);
+    TH1F* h_t1_mass  = new TH1F("h_t1_mass",  "Reconstructed top mass",     1000, 100000, 340000);
+    TH1F* h_t2_mass  = new TH1F("h_t2_mass",  "Reconstructed antitop mass", 1000, 100000, 340000);
 
-
-   if (fChain == 0) return;
-
-   // Get Total No. of Events Recorded
-   Long64_t nentries = fChain->GetEntriesFast();
-
-   // =========Create Histograms =========
-   // Syntsetpax: TH1F("histogram_name", "Title", number_of_bins, x_min, x_max);
-   TH1F *h_delta_T = new TH1F("h_delta_T", "delta_T discriminant | events with at least 1 electron 1 muon 2 bjets ", 1000, 0,400);
-   TH1F *h_w1_mass = new TH1F("h_w1_mass", "W+ mass  | events with at least 1 electron 1 muon 2 bjets ", 1000, 20000,140000);
-   TH1F *h_w2_mass = new TH1F("h_w2_mass", "W- mass | events with at least 1 electron 1 muon 2 bjets ", 1000, 2000,140000);
-   TH1F *h_t1_mass = new TH1F("h_t1_mass", "Top mass | events with at least 1 electron 1 muon 2 bjets ", 1000, 100000,340000);
-   TH1F *h_t2_mass = new TH1F("h_t2_mass", "Antitop mass | events with at least 1 electron 1 muon 2 bjets ", 1000, 100000,340000);
-   TH1F *h_neut_px_l1 = new TH1F("h_neut_px_l1", "h_neut_l1_px | events with at least 1 electron 1 muon 2 bjets ", 1000, 2000,140000);
-
-   // ========Loop Over All Events=========
-   for (Long64_t jentry=0; jentry<1000;jentry++)
-   {
-    // Read the Information of the No. jentry Event
-   	GetEntry(jentry);
-    // Count Electrons, Muons, BJets in Event
-    int muCount = 0; //  number of muons in event
-    int eCount = 0; //  number of electrons in event
-    int bjetCount = 0; //  number of bjets in event
-
-    for (size_t lep_i=0; lep_i<lep_n; lep_i++) // loop over leptons
+    for (Long64_t jentry = 0; jentry < 1000; jentry++)
     {
-    	if (lep_type->at(lep_i) == 11)  eCount++;  
-      	if (lep_type->at(lep_i) == 13) muCount++;
-    }
+        GetEntry(jentry);
 
-    for(size_t jet_i=0; jet_i<jet_trueflav->size(); jet_i++) // loop over jets
-    {
-    	if (jet_trueflav->at(jet_i) ==5) bjetCount++; 
-    }
+        // Count particle types
+        int eCount = 0, muCount = 0, bjetCount = 0;
+        for (size_t i = 0; i < lep_n; i++) {
+            if (lep_type->at(i) == 11) eCount++;
+            if (lep_type->at(i) == 13) muCount++;
+        }
+        for (size_t i = 0; i < jet_trueflav->size(); i++) {
+            if (jet_trueflav->at(i) == 5) bjetCount++;
+        }
 
-    // Only select events with more than 1 electron, 1 muon, 2 bjets
-    // Select higher pt electron and muon
-	if (eCount>=1 && muCount >=1 && bjetCount >= 2)
-    {
-    	double e_pt[10] = {}; double mu_pt[10] = {}; double bjet_pt[20] = {};
+        if (eCount < 1 || muCount < 1 || bjetCount < 2) continue;
 
-    	for (size_t lep_i=0; lep_i<lep_n; lep_i++) // loop over leptons
-    	{
-    		if (lep_type->at(lep_i) == 11)   // record kinematic info of electrons into array
-    		{
-    			e_pt[lep_i] = lep_pt->at(lep_i); 
-        	}
-        	if (lep_type->at(lep_i) == 13)  // record kinematic info of muons into array
-        	{
-      			mu_pt[lep_i] =  lep_pt->at(lep_i);
-        	}
-    	} // end of loop over leptons
+        // Collect pT values
+        double e_pt[10]    = {};
+        double mu_pt[10]   = {};
+        double bjet_pt[20] = {};
 
-     	for(size_t jet_i=0; jet_i<jet_trueflav->size(); jet_i++) // loop over jets
-      	{
-        	if (jet_trueflav->at(jet_i) ==5) 
-          	{
-            	bjet_pt[jet_i] = jet_pt->at(jet_i); // record kinematic info of bjets into array
-          	} 
-      	}// end of loop over jets
+        for (size_t i = 0; i < lep_n; i++) {
+            if (lep_type->at(i) == 11) e_pt[i]  = lep_pt->at(i);
+            if (lep_type->at(i) == 13) mu_pt[i] = lep_pt->at(i);
+        }
+        for (size_t i = 0; i < jet_trueflav->size(); i++) {
+            if (jet_trueflav->at(i) == 5) bjet_pt[i] = jet_pt->at(i);
+        }
 
+        // Find highest-pT candidates
+        int e_index  = std::distance(std::begin(e_pt),
+                           std::max_element(std::begin(e_pt), std::end(e_pt)));
+        int mu_index = std::distance(std::begin(mu_pt),
+                           std::max_element(std::begin(mu_pt), std::end(mu_pt)));
+        int bjet_index_1 = std::distance(std::begin(bjet_pt),
+                               std::max_element(std::begin(bjet_pt), std::end(bjet_pt)));
 
-    	// Select highest pt electron, muon and b jets
-    	// Find index of largest pt value in vectors e_pt, mu_pt
-    	// Note: e_index is same as highest pt lep_i electron
-    	int e_index = std::distance(std::begin(e_pt), std::max_element(std::begin(e_pt), std::end(e_pt))); 
-    	int mu_index = std::distance(std::begin(mu_pt), std::max_element(std::begin(mu_pt), std::end(mu_pt)));
-  		int bjet_index_1 = std::distance(std::begin(bjet_pt), std::max_element(std::begin(bjet_pt), std::end(bjet_pt)));
+        int bjet_index_2 = 0;
+        double bjet_pt_2nd = 0;
+        for (int i = 0; i < 20; i++) {
+            if (bjet_pt[i] == jet_pt->at(bjet_index_1)) continue;
+            if (bjet_pt[i] > bjet_pt_2nd) {
+                bjet_pt_2nd  = bjet_pt[i];
+                bjet_index_2 = i;
+            }
+        }
 
-    	// find value of 2nd largest pt in jet_pt array
-    	int bjet_index_2 = 0;  
-    	double bjet_pt_2 = 0;
-   		for(int i=0; i<20; i++)
-    	{
-      		if(bjet_pt[i] == jet_pt->at(bjet_index_1)) {continue;} // do not consider largest pt in array
-      		if(bjet_pt[i] > bjet_pt_2) 
-      		{
-       			bjet_pt_2 = bjet_pt[i];
-        		bjet_index_2 = i;
-      		}
-    	}
-    	// End of selecting higehest pt 
+        // Apply pT > 25 GeV and opposite-sign cuts
+        bool pass_pt = (lep_pt->at(e_index)       >= PT_CUT &&
+                        lep_pt->at(mu_index)       >= PT_CUT &&
+                        jet_pt->at(bjet_index_1)   >= PT_CUT &&
+                        jet_pt->at(bjet_index_2)   >= PT_CUT);
+        bool opposite_sign = ((lep_charge->at(e_index) ==  1 && lep_charge->at(mu_index) == -1) ||
+                              (lep_charge->at(e_index) == -1 && lep_charge->at(mu_index) ==  1));
 
-		// Additional requirement that event has to have e_pt > 25Gev and mu_pt>20Gev and oppposite charges
-		if( (lep_pt->at(e_index)>=25000 && lep_pt->at(mu_index)>=25000 && lep_charge->at(e_index)==1 
-			&& lep_charge->at(mu_index)==-1) || (lep_pt->at(e_index)>=25000 && lep_pt->at(mu_index)>=25000 
-			&& lep_charge->at(e_index)==-1 && lep_charge->at(mu_index)==1) )
-		{
-   			/* Minimize Tfunction (possibly many times) */
+        if (!pass_pt || !opposite_sign) continue;
 
-			double delta_T; double m_w1; double m_w2; double m_t1; double m_t2; double neut_px_l1;
-   			
-   			const int repeat = 100; // number of times to repeat the minimization
-   			const int outputs = 6;  // number of outputs from MinimizaTfunction()
+        bool e_positive = (lep_charge->at(e_index) == 1);
 
-   			// Initialise 2D Matrix that stores output from each minimization attempt
-   			// E.g. { {delta_T m_w1 m_w2 m_t1 m_t2},   <- Minimization Attempt 1
-   			//        {delta_T m_w1 m_w2 m_t1 m_t2},   <- Minimization Attempt 2
-   			//        ...                            }
-   			double minimized_combo1[repeat][outputs];  // First combination of bjets
-   			double minimized_combo2[repeat][outputs];  // Second combination of bjets
+        // Run minimization for both b-jet combinations and keep the best
+        MinResult combo1, combo2;
 
-   			// Repeat minimization n times
-   			for (int i=0; i<repeat; i++)
-   			{
-   				// If final product is positron and muon
-   				if (lep_charge->at(e_index)==1 && lep_charge->at(mu_index)==-1)
-   				{
-   					// Do the minimization for first combination of bjet
-					tie(minimized_combo1[i][0], minimized_combo1[i][1], minimized_combo1[i][2],
-						minimized_combo1[i][3], minimized_combo1[i][4], minimized_combo1[i][5]) 
-					= MinimizeTfunction( 
-						lep_pt->at(e_index), lep_phi->at(e_index), lep_eta->at(e_index), 0.511, 
-						lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), 105.66, 
-						met_et,  met_phi, 
-						jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1), jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1), 
-						jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2), jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2) 
-						);
-					// Do the minimization for second combination of bjet
-					tie(minimized_combo2[i][0], minimized_combo2[i][1], minimized_combo2[i][2],
-						minimized_combo2[i][3], minimized_combo2[i][4], minimized_combo1[i][5]) 
-					= MinimizeTfunction( 
-						lep_pt->at(e_index), lep_phi->at(e_index), lep_eta->at(e_index), 0.511, 
-						lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), 105.66, 
-						met_et,  met_phi, 
-						jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2), jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2), 
-						jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1), jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1) 
-						);
-   				}
-   				// If final product is electron and antimuon
-   				if (lep_charge->at(e_index)==-1 && lep_charge->at(mu_index)==1)
-   				{
-   					// Do the minimization for first combination of bjet
-					tie(minimized_combo1[i][0], minimized_combo1[i][1], minimized_combo1[i][2],
-						minimized_combo1[i][3], minimized_combo1[i][4], minimized_combo1[i][5]) 
- 					= MinimizeTfunction( 
-						lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), 105.66, 
-						lep_pt->at(e_index), lep_phi->at(e_index), lep_eta->at(e_index), 0.511, 
-						met_et,  met_phi, 
-						jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1), jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1), 
-						jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2), jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2) 
-						);
-					// Do the minimization for second combination of bjet
-					tie(minimized_combo2[i][0], minimized_combo2[i][1], minimized_combo2[i][2],
-						minimized_combo2[i][3], minimized_combo2[i][4], minimized_combo1[i][5]) 
-					= MinimizeTfunction( 
-						lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), 105.66, 
-						lep_pt->at(e_index), lep_phi->at(e_index), lep_eta->at(e_index), 0.511, 
-						met_et,  met_phi, 
-						jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2), jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2), 
-						jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1), jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1) 
-						);
+        if (e_positive) {
+            // positron + muon
+            combo1 = MinimizeTfunction(
+                lep_pt->at(e_index),  lep_phi->at(e_index),  lep_eta->at(e_index),  M_ELECTRON,
+                lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), M_MUON,
+                met_et, met_phi,
+                jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1),
+                jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1),
+                jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2),
+                jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2));
 
-   				}
-   			}// End of repeat minimization
+            combo2 = MinimizeTfunction(
+                lep_pt->at(e_index),  lep_phi->at(e_index),  lep_eta->at(e_index),  M_ELECTRON,
+                lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), M_MUON,
+                met_et, met_phi,
+                jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2),
+                jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2),
+                jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1),
+                jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1));
+        } else {
+            // electron + antimuon
+            combo1 = MinimizeTfunction(
+                lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), M_MUON,
+                lep_pt->at(e_index),  lep_phi->at(e_index),  lep_eta->at(e_index),  M_ELECTRON,
+                met_et, met_phi,
+                jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1),
+                jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1),
+                jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2),
+                jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2));
 
-   			// Find smallest value of delta T (a stupid bu straightforward way)
-   			double delta_T_combo1[repeat]; double delta_T_combo2[repeat]; // create delta_T arrays
-   			for(int i=0; i<repeat; i++)  // fill delta_T arrays
-   			{
-   				delta_T_combo1[i] = minimized_combo1[i][0];
-   				delta_T_combo2[i] = minimized_combo2[i][0];
-   			}
-   			// Find index of smallest delta_T in delta_T arrays
-   			int delta_T_combo1_index = std::distance(std::begin(delta_T_combo1), std::min_element(std::begin(delta_T_combo1), std::end(delta_T_combo1))); 
-    		int delta_T_combo2_index = std::distance(std::begin(delta_T_combo2), std::min_element(std::begin(delta_T_combo2), std::end(delta_T_combo2)));
-    		// Find smaller delta_T between the two combinations && assign minimized values associated with that delta T
-    		if(delta_T_combo1[delta_T_combo1_index] <= delta_T_combo2[delta_T_combo2_index])
-    		{
-    			delta_T = minimized_combo1[delta_T_combo1_index][0];
-    			m_w1 = minimized_combo1[delta_T_combo1_index][1]; // Mass of W+
-    			m_w2 = minimized_combo1[delta_T_combo1_index][2]; // Mass of W-
-    			m_t1 = minimized_combo1[delta_T_combo1_index][3];  // Mass of top
-    			m_t2 = minimized_combo1[delta_T_combo1_index][4];  // Mass of antitop
-			neut_px_l1 = minimized_combo1[delta_T_combo1_index][5]; 
-    		}
-    		else if (delta_T_combo1[delta_T_combo1_index] > delta_T_combo2[delta_T_combo2_index])
-    		{
-    			delta_T = minimized_combo2[delta_T_combo2_index][0];
-    			m_w1 = minimized_combo2[delta_T_combo2_index][1];
-    			m_w2 = minimized_combo2[delta_T_combo2_index][2];
-    			m_t1 = minimized_combo2[delta_T_combo2_index][3];
-    			m_t2 = minimized_combo2[delta_T_combo2_index][4];
-			neut_px_l1 = minimized_combo2[delta_T_combo2_index][5]; 
-    		}
+            combo2 = MinimizeTfunction(
+                lep_pt->at(mu_index), lep_phi->at(mu_index), lep_eta->at(mu_index), M_MUON,
+                lep_pt->at(e_index),  lep_phi->at(e_index),  lep_eta->at(e_index),  M_ELECTRON,
+                met_et, met_phi,
+                jet_E->at(bjet_index_2), jet_pt->at(bjet_index_2),
+                jet_phi->at(bjet_index_2), jet_eta->at(bjet_index_2),
+                jet_E->at(bjet_index_1), jet_pt->at(bjet_index_1),
+                jet_phi->at(bjet_index_1), jet_eta->at(bjet_index_1));
+        }
 
+        // Select the combination with the smaller ΔT
+        const MinResult& best = (combo1.delta_T <= combo2.delta_T) ? combo1 : combo2;
 
-    		// Fill histograms for events e_pt > 25Gev and mu_pt>20Gev and oppposite charges
-    		h_delta_T -> Fill(delta_T);
-    		h_w1_mass -> Fill(m_w1);
-    		h_w2_mass -> Fill (m_w2);
-    		h_t1_mass -> Fill (m_t1);
-    		h_t2_mass -> Fill(m_t2);
-		h_neut_px_l1 -> Fill(neut_px_l1); 
+        h_delta_T->Fill(best.delta_T);
+        h_w1_mass->Fill(best.m_w1);
+        h_w2_mass->Fill(best.m_w2);
+        h_t1_mass->Fill(best.m_t1);
+        h_t2_mass->Fill(best.m_t2);
 
+    } // end event loop
 
-			// Print the delta from each minimization attempt	
-			cout << "For event no. "<< jentry<< ", the 100 minimization attempts: " <<endl;
-            cout << "No. of b jets: " << bjetCount << endl;
-			cout << "Momenta of the bjets are: ";
-			for (int i=0; i<20; i++) 
-			{
-				cout << bjet_pt[i] << " ";
-			} 
-			cout << endl;
-			
-			for (int i=0; i<100; i++)
-			{
-				cout << "delta T_combo1: " << delta_T_combo1[i]<< "\t" <<  "delta T_combo2: " << delta_T_combo2[i] << endl
-				<< "m_w1_c1: " << minimized_combo1[delta_T_combo1_index][1] << " m_w1_c2: " << minimized_combo2[delta_T_combo2_index][1] << 					endl
-				<< "m_w2_c1: " << minimized_combo1[delta_T_combo1_index][2] << " m_w2_c2: " << minimized_combo2[delta_T_combo2_index][2]
-				<< endl
-				<< " m_t1_c1: " << minimized_combo1[delta_T_combo1_index][3] << " m_t1_c2: " <<  minimized_combo2[delta_T_combo2_index][3]
-				<< endl
-				<< "m_t2_c1: " << minimized_combo1[delta_T_combo1_index][4] << " m_t2_c2: " << minimized_combo2[delta_T_combo2_index][4]
-				<< endl
-				<< "neut_px_l1_c1: " << minimized_combo1[delta_T_combo1_index][5] << " neut_px_l1_c2: " << minimized_combo2[delta_T_combo2_index][5]
-				<< endl;
-			}
-
-		}// End of requirement events e_pt > 25Gev and mu_pt>20Gev and oppposite charges
-	}//End of only select only select events with more than 1 electron, 1 muon, 2 bjets
-
-
-
-
-
-	 
-
-	
-
-   } // End of Loop Over All Events
-
-
-
-   // ======= Draw Histograms ===========
-
-	h_delta_T -> Draw();
-
-
-
-
-   
-
-   
-
-
+    h_delta_T->Draw();
 }
