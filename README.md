@@ -1,4 +1,4 @@
-# ATLAS Di-Higgs Discrimination Project (Particle Physics)
+# Kinematic Reconstruction and Signal Discrimination for HH → bbτ_h τ_l at ATLAS
 
 ## Overview
 
